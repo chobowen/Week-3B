@@ -1,0 +1,195 @@
+---
+title: "DATA 607: Week 3B"
+subtitle: "Window Functions"
+author: "Bowen Cho"
+format: html
+editor: visual
+execute:
+  echo: true
+---
+
+## Approach
+
+I am choosing to work with historical temperature data for Central Park, NY, which I downloaded as a csv file from [The Climate Explorer](https://crt-climate-explorer.nemac.org/historical_weather_data/?county=New+York+County&city=New+York%2C+NY&fips=36061&lat=40.71&lon=-74.01&mode=daily_vs_climate&zoom=9&station=USW00094728&station-name=NY+CITY+CENTRAL+PARK) website. I then uploaded this table into the PostgreSQL database.
+
+### Roadmap
+
+1.  Connect to PostgreSQL from R.
+2.  Import the table.
+3.  Send SQL window-function queries to PostgreSQL.
+4.  Bring each query result back to R as a tibble.
+
+## Connect to the globalWarming database
+
+```{r}
+
+library(DBI)
+library(RPostgres)
+library(tidyverse)
+
+con <- dbConnect(
+  RPostgres::Postgres(),
+  dbname = "DATA 607",
+  host = "localhost",
+  port = 5432,
+  user = "postgres",
+  password = 
+)
+```
+
+## Import the SQL table into an R data frame
+
+```{r}
+#| eval: true
+
+globalWarming <- dbReadTable(con, "globalWarming") |>
+  as_tibble() |>
+  mutate(date = as.Date(as.character(date), format = "%Y%m%d"))
+
+head(globalWarming)
+```
+
+globalWarming is now an R tibble. The PostgreSQL table remains unchanged in the database.
+
+## Overall average maximum temp and differentials
+
+I computed the average maximum temperature for the entire data set (**`max_avg`**), as well as the daily differences (**`max_differential`**) between the maximum daily temperatures and the normal maximum daily temperature (**`normal_max`**).
+
+Note that I don't use OVER () in the line: ROUND(max - normal_max), 1) since I am not calculating over multiple rows. The computation is done using values within each row rather than across all the rows of the table.
+
+```{r}
+#| eval: true
+
+temp_NY <- dbGetQuery(con, "
+  SELECT
+  date,
+  max,
+  normal_max,
+  ROUND(AVG(max) OVER (), 1) AS max_avg,
+  ROUND(max - normal_max, 1) as daily_max_differential
+  FROM \"globalWarming\"
+  ORDER BY date
+") |>
+  as_tibble()
+
+temp_NY
+```
+
+## Average maximum temperature differential by year
+
+I find SQL to be very unintuitive, and this code for finding the average maximum temperature differentials by year gave me lots of problems. I needed Google AI to assist with debugging. The main problems were getting the year into proper date format, and since I foolishly included a capital letter in my data set name, SQL required quotes around the title. This confused R since a quote already appears in the first line of code, so I had to escape the quotes around the title with a backslash.
+
+```{r}
+#| eval: true
+
+temp_NY <- dbGetQuery(con, "
+  SELECT
+  EXTRACT(YEAR FROM TO_DATE(date, 'YYYYMMDD')) AS year_NY,
+  ROUND(AVG(max - normal_max), 1) AS yearly_max_differential
+  FROM \"globalWarming\"
+  GROUP BY year_NY
+  ORDER BY year_NY
+") |>
+  as_tibble()
+
+temp_NY
+```
+
+## Average maximum temperature by year
+
+The following analysis of average maximum temperatures for each year is not really insightful. It's just practice (and to satisfy the assignment requirements) for using partitioning to compare each row with the corresponding yearly average:
+
+```{r}
+#| eval: true
+
+temp_NY <- dbGetQuery(con, "
+  SELECT
+  date,
+  max,
+  ROUND(AVG(max) OVER (PARTITION BY EXTRACT(YEAR FROM TO_DATE(date, 'YYYYMMDD'))), 1) AS yearly_avg_max
+  FROM \"globalWarming\"
+") |>
+  as_tibble()
+
+temp_NY
+```
+
+## Rank each year by temperature differential
+
+Well here is something finally useful! We see that most of the years with average high temperatures that exceeded normal high temperatures occurred in the 2000s.
+
+```{r}
+#| eval: true
+
+temp_NY <- dbGetQuery(con, "
+  SELECT
+  EXTRACT(YEAR FROM TO_DATE(date, 'YYYYMMDD')) AS year_NY,
+  ROUND(AVG(max - normal_max), 1) AS yearly_max_diff,
+  RANK() OVER (
+  ORDER BY AVG(max - normal_max) DESC) AS temp_rank
+  FROM \"globalWarming\"
+  GROUP BY year_NY
+  ORDER BY temp_rank
+") |>
+  as_tibble()
+
+temp_NY
+```
+
+## Conclusion: DPLYR \> SQL
+
+SQL is maddeningly difficult to work with. My main takeaway from this assignment is that if you have to do any sort of data manipulation on a data frame, do it in R. For example, if I want to find the maximum daily temperature within each year and rank them from hottest to least hot, I would have no idea how to do that with SQL. In R, it's just a few simple lines of code.
+
+First, import the table:
+
+```{r}
+#| eval: true
+temp_NY <- dbGetQuery(con, "
+  SELECT
+  date,
+  min,
+  max,
+  normal_min,
+  normal_max
+  FROM \"globalWarming\"
+") |>
+  as_tibble()
+
+temp_NY
+```
+
+Then, convert the date variable into year-month-day format; create a new column to hold the years data; remove all rows pertaining to years after 2026; collapse all rows by years and find the max temperature for each year; and finally, sort. Nice and simple.
+
+```{r}
+
+library(dplyr)
+library(lubridate)
+
+temp_NY <- temp_NY %>%
+  mutate(
+    date = ymd(date),
+    year = year(date)) %>%
+  filter(year < 2027) %>%
+  group_by(year) %>%
+  summarize(max_temp = max(max, na.rm = TRUE)) %>%
+  arrange(desc(max_temp))
+```
+
+## Close the database connection
+
+```{r}
+#| eval: true
+
+dbDisconnect(con)
+```
+
+## References
+
+NOAA Regional Climate Centers. (2026). Historical Weather Data for NY CITY CENTRAL PARK, STATION: USW00094728. The Climate Explorer. <https://crt-climate-explorer.nemac.org/historical_weather_data/?county=New+York+County&city=New+York%2C+NY&fips=36061&lat=40.71&lon=-74.01&mode=daily_vs_climate&zoom=9&station=USW00094728&station-name=NY+CITY+CENTRAL+PARK>.
+
+## AI Use
+
+Google Gemini was used as an AI-assisted development tool for a part of this Assignment. Its suggested code was reviewed, tested, and revised by the author for help understanding how to implement SQL window functions in R. The author remains responsible for all work submitted for this Assignment.
+
+**Tool/model:** Gemini 3.5 Flash **Developer:** Google\
+**Date accessed:** September 20, 2026
